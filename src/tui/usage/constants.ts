@@ -2,7 +2,7 @@ import type { Tab, TimeWindow } from "./types.ts";
 
 export const ALL_TABS: Tab[] = [
   { id: "overview", name: "Overview", key: "1" },
-  { id: "today", name: "Today", key: "2" },
+  { id: "history", name: "History", key: "2" },
   { id: "models", name: "Models", key: "3" },
   { id: "providers", name: "Providers", key: "4" },
   { id: "tokens", name: "Tokens", key: "5" },
@@ -43,9 +43,22 @@ export function cycleTimeWindow(current: TimeWindow, direction: 1 | -1): TimeWin
   return WINDOW_ORDER[next]!;
 }
 
-/** Whether the active window applies to a given tab. */
+/**
+ * Whether the active window applies to a given tab. Only Recent is exempt:
+ * Overview honours the window but draws the selector inline, and History,
+ * Models, Providers, Tokens, Clients and Npubs all follow it.
+ */
 export function tabSupportsWindow(tabId: Tab["id"]): boolean {
-  return tabId !== "overview" && tabId !== "today" && tabId !== "recent";
+  return tabId !== "recent";
+}
+
+/**
+ * Whether the window selector belongs in the top chrome. Overview honours the
+ * window but renders the selector inside its own content (right under the
+ * Balance box) instead, so it is excluded from the chrome bar.
+ */
+export function tabShowsWindowBarInChrome(tabId: Tab["id"]): boolean {
+  return tabSupportsWindow(tabId) && tabId !== "overview";
 }
 
 export const COLORS = {
@@ -59,6 +72,7 @@ export const COLORS = {
   magenta: "\x1b[35m",
   cyan: "\x1b[36m",
   white: "\x1b[37m",
+  orange: "\x1b[38;5;208m",
   bgBlue: "\x1b[44m",
   bgGreen: "\x1b[42m",
   bgYellow: "\x1b[43m",

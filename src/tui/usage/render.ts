@@ -1,4 +1,4 @@
-import { CLIENT_COLORS, COLORS, MODEL_COLORS, WINDOW_LABELS, WINDOW_ORDER, tabSupportsWindow } from "./constants.ts";
+import { CLIENT_COLORS, COLORS, MODEL_COLORS, WINDOW_LABELS, WINDOW_ORDER, tabShowsWindowBarInChrome } from "./constants.ts";
 import type { Tab } from "./types.ts";
 import {
   formatNumber,
@@ -7,9 +7,9 @@ import {
   type ClientNaming,
 } from "./data.ts";
 import { vimState } from "./state.ts";
-import { stripAnsi } from "./terminal.ts";
+import { stripAnsi, truncateAnsi } from "./terminal.ts";
 import type { BalanceInfo, StatusInfo } from "./data.ts";
-import type { TabId, TimeWindow, UpdateInfo, UsageStats } from "./types.ts";
+import type { TabId, TimeWindow, TimelineBucket, TimelinePoint, UpdateInfo, UsageStats } from "./types.ts";
 
 /** Format a cost value: 0.12, 1.23, 12.34, 123.45, 1.23k, 1.23m */
 function formatCost(value: number): string {
@@ -59,18 +59,32 @@ export function renderTabs(activeTab: TabId, visibleTabs: Tab[]): string {
   return `${" ".repeat(2)}${tabStr}\n`;
 }
 
+/** The `All 24h 7d 30d` choices with the active one highlighted. */
+function windowChoices(activeWindow: TimeWindow): string {
+  return WINDOW_ORDER.map((id) => id === activeWindow
+    ? `${COLORS.bgGreen}${COLORS.bold} ${WINDOW_LABELS[id]} ${COLORS.reset}`
+    : `${COLORS.dim}${WINDOW_LABELS[id]}${COLORS.reset}`).join("  ");
+}
+
 /**
- * Time-window selector line. The active window is highlighted. Tabs that
- * ignore the window (Overview/Today/Recent) render nothing at all: a selector
- * that cannot be acted on is noise.
+ * Time-window selector line for the top chrome. Tabs that ignore the window
+ * (Recent) render nothing at all — a selector that cannot be acted on is
+ * noise — and Overview renders it inline instead (see
+ * {@link renderWindowSelector}).
  */
 export function renderWindowBar(activeWindow: TimeWindow, activeTab: TabId): string {
-  if (!tabSupportsWindow(activeTab)) return "";
+  if (!tabShowsWindowBarInChrome(activeTab)) return "";
 
-  const parts = WINDOW_ORDER.map((id) => id === activeWindow
-    ? `${COLORS.bgGreen}${COLORS.bold} ${WINDOW_LABELS[id]} ${COLORS.reset}`
-    : `${COLORS.dim}${WINDOW_LABELS[id]}${COLORS.reset}`);
-  return `  ${COLORS.dim}window:${COLORS.reset} ${parts.join("  ")}\n`;
+  return `  ${COLORS.dim}window:${COLORS.reset} ${windowChoices(activeWindow)}\n`;
+}
+
+/**
+ * Inline window selector. Overview draws this inside its content, directly
+ * under the Balance box, because the chrome bar scrolls away from the figures
+ * it scopes. It carries its own `[W]` hint since the header isn't next to it.
+ */
+export function renderWindowSelector(activeWindow: TimeWindow): string {
+  return `${windowChoices(activeWindow)}   ${COLORS.dim}[W] cycle${COLORS.reset}`;
 }
 
 export function renderSeparator(width: number): string {
@@ -89,7 +103,9 @@ export function renderBox(lines: string[], width: number, title?: string): strin
     result.push(`┌${"─".repeat(Math.max(0, width - 2))}┐`);
   }
   
-  for (const line of lines) {
+  for (const rawLine of lines) {
+    // Truncate first so an overlong line can never push the right border out.
+    const line = truncateAnsi(rawLine, innerWidth);
     const padding = Math.max(0, innerWidth - stripAnsi(line).length);
     result.push(`│ ${line}${" ".repeat(padding)} │`);
   }
@@ -132,10 +148,32 @@ export function renderBarChart(
 }
 
 
-export function renderOverview(stats: UsageStats, balance: BalanceInfo | null, status: StatusInfo | null, width: number): string {
-  const totals = stats.summary.totals;
-  const totalRequests = stats.totalEntries; // Use server's total count, not entries.length
-  const totalVisibleCost = stats.totalSatsCost; // <-- Use server's total, not client-side sum of limited entries
+/** Merge two rendered boxes into rows of full width, padding the shorter one. */
+function combineSideBySide(left: string, right: string, leftWidth: number, rightWidth: number): string {
+  const leftLines = left.split("\n");
+  const rightLines = right.split("\n");
+  const rows = Math.max(leftLines.length, rightLines.length);
+  const lines: string[] = [];
+  for (let i = 0; i < rows; i++) {
+    const l = leftLines[i] || " ".repeat(leftWidth);
+    const r = rightLines[i] || " ".repeat(rightWidth);
+    lines.push(l + r);
+  }
+  return lines.join("\n");
+}
+
+export function renderOverview(
+  stats: UsageStats,
+  balance: BalanceInfo | null,
+  status: StatusInfo | null,
+  width: number,
+  activeWindow: TimeWindow,
+): string {
+  // Overview honours the [W] window selector: every figure below is scoped to
+  // the selected window, so "Total Spent" means "spent in this window".
+  const totals = stats.window.totals;
+  const totalRequests = totals.requests;
+  const totalVisibleCost = totals.satsCost;
   const avgCost = totalRequests > 0 ? totalVisibleCost / totalRequests : 0;
   const avgTokens = totalRequests > 0 ? totals.totalTokens / totalRequests : 0;
 
@@ -154,23 +192,6 @@ export function renderOverview(stats: UsageStats, balance: BalanceInfo | null, s
   const halfWidth1 = Math.floor(width / 2);
   const halfWidth2 = width - halfWidth1;
 
-  const leftBoxStr = renderBox(leftBox, halfWidth1, "Stats of Sats");
-  const rightBoxStr = renderBox(rightBox, halfWidth2, "Token Stats");
-
-  const leftLines = leftBoxStr.split("\n");
-  const rightLines = rightBoxStr.split("\n");
-  const maxLines = Math.max(leftLines.length, rightLines.length);
-
-  const combinedLines: string[] = [];
-  for (let i = 0; i < maxLines; i++) {
-    const l = leftLines[i] || " ".repeat(halfWidth1);
-    const r = rightLines[i] || " ".repeat(halfWidth2);
-    combinedLines.push(l + r);
-  }
-
-  let output = combinedLines.join("\n");
-
-  // Status and Balance boxes side by side
   const statusLines: string[] = [];
   if (status) {
     const daemonColor = status.daemon === "running" ? COLORS.green : COLORS.red;
@@ -194,8 +215,10 @@ export function renderOverview(stats: UsageStats, balance: BalanceInfo | null, s
     statusLines.push(`${COLORS.dim}Status unavailable${COLORS.reset}`);
   }
 
-  // Display all balances (wallet, cached tokens, API keys) if available
-  if (balance && balance.keys.length > 0) {
+  const sections: string[] = [];
+
+  // Balance and status boxes side by side.
+  if (balance) {
     const balanceLines: string[] = [];
     const totalBalance = balance.total;
 
@@ -222,45 +245,30 @@ export function renderOverview(stats: UsageStats, balance: BalanceInfo | null, s
       balanceLines.push(`${COLORS.dim}No funds available${COLORS.reset}`);
     }
 
-    // Render status and balance boxes side by side
-    const balanceBoxStr = renderBox(balanceLines, halfWidth1, "Balance");
-    const statusBoxStr = renderBox(statusLines, halfWidth2, "System Status");
-    const balanceBoxLines = balanceBoxStr.split("\n");
-    const statusBoxLines = statusBoxStr.split("\n");
-    const statusBalanceMaxLines = Math.max(balanceBoxLines.length, statusBoxLines.length);
-
-    const statusBalanceLines: string[] = [];
-    for (let i = 0; i < statusBalanceMaxLines; i++) {
-      const b = balanceBoxLines[i] || " ".repeat(halfWidth1);
-      const s = statusBoxLines[i] || " ".repeat(halfWidth2);
-      statusBalanceLines.push(b + s);
-    }
-    output = statusBalanceLines.join("\n") + "\n" + output;
-  } else if (balance && balance.keys.length === 0) {
-    // Only balance is empty, show status next to empty balance box
-    const balanceLines: string[] = [
-      `${COLORS.bold}Total Balance:${COLORS.reset} ${COLORS.red}0 sat${COLORS.reset}`,
-      `${COLORS.dim}No funds available${COLORS.reset}`,
-    ];
-    const balanceBoxStr = renderBox(balanceLines, halfWidth1, "Balance");
-    const statusBoxStr = renderBox(statusLines, halfWidth2, "System Status");
-    const balanceBoxLines = balanceBoxStr.split("\n");
-    const statusBoxLines = statusBoxStr.split("\n");
-    const statusBalanceMaxLines = Math.max(balanceBoxLines.length, statusBoxLines.length);
-
-    const statusBalanceLines: string[] = [];
-    for (let i = 0; i < statusBalanceMaxLines; i++) {
-      const b = balanceBoxLines[i] || " ".repeat(halfWidth1);
-      const s = statusBoxLines[i] || " ".repeat(halfWidth2);
-      statusBalanceLines.push(b + s);
-    }
-    output = statusBalanceLines.join("\n") + "\n" + output;
+    sections.push(combineSideBySide(
+      renderBox(balanceLines, halfWidth1, "Balance"),
+      renderBox(statusLines, halfWidth2, "System Status"),
+      halfWidth1,
+      halfWidth2,
+    ));
   } else {
-    // No balance data, just show status box full width
-    output = renderBox(statusLines, width, "System Status") + "\n" + output;
+    // No balance data — status takes the full width.
+    sections.push(renderBox(statusLines, width, "System Status"));
   }
 
-  const modelStats = stats.summary.models;
+  // Window selector, directly under the Balance box: it scopes everything that
+  // follows, so it reads as part of the balance/status header rather than as
+  // tab chrome (which the Overview content scrolls away from).
+  sections.push(renderBox([renderWindowSelector(activeWindow)], width, "Time Window"));
+
+  sections.push(combineSideBySide(
+    renderBox(leftBox, halfWidth1, "Stats of Sats"),
+    renderBox(rightBox, halfWidth2, "Token Stats"),
+    halfWidth1,
+    halfWidth2,
+  ));
+
+  const modelStats = stats.window.models;
   if (modelStats.length > 0) {
     const maxCost = modelStats[0]!.satsCost;
     const totalCost = Math.max(totalVisibleCost, 1);
@@ -276,10 +284,10 @@ export function renderOverview(stats: UsageStats, balance: BalanceInfo | null, s
       "models",
     ));
     endBarSection("models");
-    output += "\n" + renderBox(modelLines, width, "Top Models by Cost");
+    sections.push(renderBox(modelLines, width, "Top Models by Cost"));
   }
 
-  const clientStats = stats.summary.clients;
+  const clientStats = stats.window.clients;
   if (clientStats.length > 0) {
     const maxCost = clientStats[0]!.satsCost;
     const totalCost = Math.max(totalVisibleCost, 1);
@@ -295,89 +303,231 @@ export function renderOverview(stats: UsageStats, balance: BalanceInfo | null, s
       "clients",
     ));
     endBarSection("clients");
-    output += "\n" + renderBox(clientLines, width, "Usage by Client");
+    sections.push(renderBox(clientLines, width, "Usage by Client"));
   }
 
-  return output;
+  return sections.join("\n");
 }
 
-export function renderToday(stats: UsageStats, width: number): string {
-  const currentHour = new Date().getHours();
-  // Build today's date string from LOCAL date components so it matches the
-  // server's tz-bucketed day keys (which use the client's tzOffsetMinutes).
-  const _now = new Date();
-  const todayDateStr = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, "0")}-${String(_now.getDate()).padStart(2, "0")}`;
+/** Format a sats value compactly for the chart's y-axis: 0, 42, 1.2k, 3.4M. */
+function formatSatsAxis(value: number): string {
+  if (value >= 1_000_000) return (value / 1_000_000).toFixed(1) + "M";
+  if (value >= 1_000) return (value / 1_000).toFixed(1) + "k";
+  if (value >= 100 || Number.isInteger(value)) return String(Math.round(value));
+  return String(Number(value.toPrecision(3)));
+}
 
-  let todayStats: { date: string; requests: number; satsCost: number; promptTokens: number; completionTokens: number; totalTokens: number } = {
-    date: todayDateStr,
-    requests: 0,
-    satsCost: 0,
-    promptTokens: 0,
-    completionTokens: 0,
-    totalTokens: 0,
-  };
-  let recentDays: Array<{ date: string; requests: number; satsCost: number; totalTokens: number; promptTokens: number; completionTokens: number }> = [];
-  let hourlyMap: Map<number, { requests: number; satsCost: number }> = new Map();
+/** Round up to a readable 1/2/5 × power-of-ten axis ceiling. */
+function niceAxisCeiling(peak: number): number {
+  if (peak <= 0) return 1;
+  const magnitude = 10 ** Math.floor(Math.log10(peak));
+  const normalized = peak / magnitude;
+  const step = [1, 2, 5, 10].find((value) => normalized <= value)!;
+  return step * magnitude;
+}
 
-  if (stats.summary) {
-    // Use server-aggregated data
-    const { days, hoursToday } = stats.summary;
-    // days[0] is most-recent-first; check if it's today
-    const todayDayStat = days[0]?.date === todayDateStr ? days[0] : undefined;
-    if (todayDayStat) {
-      todayStats = { date: todayDayStat.date, requests: todayDayStat.requests, satsCost: todayDayStat.satsCost, promptTokens: todayDayStat.promptTokens, completionTokens: todayDayStat.completionTokens, totalTokens: todayDayStat.totalTokens };
+/** Axis tick label for a bucket: `09` (hour) or `05-20` (day/week). */
+function timelineAxisLabel(point: TimelinePoint, bucket: TimelineBucket): string {
+  if (bucket === "hour") return point.key;
+  return point.key.slice(5); // MM-DD
+}
+
+/** Fold adjacent buckets together so a long series still fits the columns. */
+function mergeTimelinePoints(points: TimelinePoint[], groupSize: number): TimelinePoint[] {
+  const merged: TimelinePoint[] = [];
+  for (let i = 0; i < points.length; i += groupSize) {
+    const chunk = points.slice(i, i + groupSize);
+    const first = chunk[0]!;
+    merged.push({
+      key: first.key,
+      timestamp: first.timestamp,
+      requests: chunk.reduce((sum, p) => sum + p.requests, 0),
+      satsCost: chunk.reduce((sum, p) => sum + p.satsCost, 0),
+      totalTokens: chunk.reduce((sum, p) => sum + p.totalTokens, 0),
+      promptTokens: chunk.reduce((sum, p) => sum + p.promptTokens, 0),
+      completionTokens: chunk.reduce((sum, p) => sum + p.completionTokens, 0),
+    });
+  }
+  return merged;
+}
+
+/** Columns kept between the spend bar and the token bar of one bucket (none). */
+const BAR_INNER_GAP = 0;
+/** Columns kept between two buckets. */
+const BAR_GROUP_GAP = 1;
+
+/**
+ * Dual-axis grouped bar chart. For every bucket an orange spend bar (left axis,
+ * sats) is drawn flush against a cyan token bar (right axis, tokens), with a
+ * gap between buckets so pairs read as pairs.
+ *
+ * `width` is the columns available inside the surrounding box; `height` is the
+ * number of bar rows.
+ */
+export function renderTimelineChart(
+  points: TimelinePoint[],
+  bucket: TimelineBucket,
+  width: number,
+  height = 10,
+): string[] {
+  if (points.length === 0) return ["No activity in this window"];
+
+  const maxCost = Math.max(...points.map((p) => p.satsCost), 0);
+  const maxTokens = Math.max(...points.map((p) => p.totalTokens), 0);
+  if (maxCost <= 0 && maxTokens <= 0) return ["No activity in this window"];
+
+  const rows = Math.max(1, Math.floor(height));
+  const minGroupCols = 2 + BAR_INNER_GAP + BAR_GROUP_GAP;
+  let groupSize = 1;
+  let slots = points;
+  let costCeiling: number;
+  let tokenCeiling: number;
+  let costTicks: string[];
+  let tokenTicks: string[];
+  let leftCol: number;
+  let rightCol: number;
+  let leftGutter: number;
+  let plotWidth: number;
+
+  // Merging changes peaks and potentially label widths. Recompute the axes
+  // after each merge; groupSize only grows, so this always terminates.
+  for (;;) {
+    slots = groupSize === 1 ? points : mergeTimelinePoints(points, groupSize);
+    costCeiling = niceAxisCeiling(Math.max(...slots.map((p) => p.satsCost), 0));
+    tokenCeiling = niceAxisCeiling(Math.max(...slots.map((p) => p.totalTokens), 0));
+    costTicks = [formatSatsAxis(costCeiling), formatSatsAxis(costCeiling / 2), "0"];
+    tokenTicks = [formatNumber(tokenCeiling), formatNumber(tokenCeiling / 2), "0"];
+    leftCol = Math.max(...costTicks.map((t) => t.length));
+    rightCol = Math.max(...tokenTicks.map((t) => t.length));
+    leftGutter = leftCol + 2; // "<label> ┤"
+    const rightGutter = rightCol + 2; // "├ <label>"
+    plotWidth = Math.max(1, width - leftGutter - rightGutter);
+    const maxGroups = Math.max(1, Math.floor(plotWidth / minGroupCols));
+    if (slots.length <= maxGroups) break;
+    groupSize = Math.max(groupSize + 1, Math.ceil(points.length / maxGroups));
+  }
+  const n = slots.length;
+
+  const groupCols = Math.max(minGroupCols, Math.floor(plotWidth / n));
+  const barWidth = Math.max(1, Math.floor((groupCols - BAR_INNER_GAP - BAR_GROUP_GAP) / 2));
+  const groupUsed = 2 * barWidth + BAR_INNER_GAP + BAR_GROUP_GAP;
+  const trailing = " ".repeat(Math.max(0, groupCols - groupUsed));
+  const plotPad = " ".repeat(Math.max(0, plotWidth - n * groupCols));
+
+  const costHeights = slots.map((p) => Math.round((p.satsCost / costCeiling) * rows));
+  const tokenHeights = slots.map((p) => Math.round((p.totalTokens / tokenCeiling) * rows));
+
+  const lines: string[] = [];
+  // Headroom row: the peak ticks float one row above the tallest bar, so a
+  // full-cell block glyph can never look like it overshoots its own axis.
+  lines.push(
+    costTicks[0]!.padStart(leftCol) + " " + COLORS.dim + "┤" + COLORS.reset +
+    " ".repeat(Math.max(0, plotWidth)) +
+    COLORS.dim + "├" + COLORS.reset + " " + tokenTicks[0]!.padEnd(rightCol),
+  );
+
+  const midRow = Math.floor((rows - 1) / 2);
+  for (let row = 0; row < rows; row++) {
+    const filledFromBottom = rows - row;
+    let plot = "";
+    for (let c = 0; c < n; c++) {
+      const costOn = costHeights[c]! >= filledFromBottom;
+      const tokenOn = tokenHeights[c]! >= filledFromBottom;
+      plot += costOn ? COLORS.orange + "█".repeat(barWidth) : " ".repeat(barWidth);
+      plot += " ".repeat(BAR_INNER_GAP);
+      plot += tokenOn ? COLORS.cyan + "█".repeat(barWidth) : " ".repeat(barWidth);
+      plot += trailing + " ".repeat(BAR_GROUP_GAP);
     }
-    // Exclude today by date (it has its own box) rather than by position —
-    // days[0] is only today when there was activity today.
-    recentDays = days.filter((d) => d.date !== todayDateStr).slice(0, 6);
-    hourlyMap = new Map(hoursToday.map((h) => [h.hour, { requests: h.requests, satsCost: h.satsCost }]));
+    plot += plotPad;
+
+    const leftLabel = row === midRow ? costTicks[1]! : "";
+    const rightLabel = row === midRow ? tokenTicks[1]! : "";
+    const left = leftLabel.padStart(leftCol) + " " + COLORS.dim + "┤" + COLORS.reset;
+    const right = COLORS.dim + "├" + COLORS.reset + " " + rightLabel.padEnd(rightCol);
+    lines.push(left + plot + COLORS.reset + right);
   }
 
-  const summaryLines = [
-    `${COLORS.bold}Date:${COLORS.reset} ${todayStats.date}`,
-    `${COLORS.bold}Requests:${COLORS.reset} ${formatReqs(todayStats.requests)}`,
-    `${COLORS.bold}Cost:${COLORS.reset} ${COLORS.green}${formatCost(todayStats.satsCost)} sats${COLORS.reset}`,
-    `${COLORS.bold}Tokens:${COLORS.reset} ${formatNumber(todayStats.totalTokens)} (p: ${formatNumber(todayStats.promptTokens)} + c: ${formatNumber(todayStats.completionTokens)})`,
+  // Bottom axis, carrying the `0` tick on both sides.
+  lines.push(
+    "0".padStart(leftCol) + " " + COLORS.dim + "└" + "─".repeat(plotWidth) + "┘" + COLORS.reset +
+    " " + "0".padEnd(rightCol),
+  );
+
+  // X labels, placed under the first column of their bucket.
+  const labelLine: string[] = [];
+  let cursor = 0;
+  for (let c = 0; c < n; c++) {
+    const column = c * groupCols;
+    if (column < cursor) continue;
+    const text = timelineAxisLabel(slots[c]!, bucket);
+    while (labelLine.length < column) labelLine.push(" ");
+    labelLine.push(...text);
+    cursor = column + text.length + 1;
+  }
+  lines.push(" ".repeat(leftGutter) + COLORS.dim + labelLine.slice(0, plotWidth).join("") + COLORS.reset);
+
+  // Legend, truncated so it can never widen the box.
+  const legendLimit = Math.max(0, width - leftGutter);
+  const legendSegments: Array<{ text: string; color: string }> = [
+    { text: "█", color: COLORS.orange },
+    { text: " spend   ", color: "" },
+    { text: "█", color: COLORS.cyan },
+    { text: " tokens   ", color: "" },
+    { text: "left: sats · right: tokens", color: COLORS.dim },
   ];
-
-  let output = renderBox(summaryLines, width, "Today");
-
-  if (recentDays.length > 0) {
-    const dayLines = recentDays.map((d) => `${d.date}: ${formatReqs(d.requests)} req, ${formatCost(d.satsCost)} sats, ${formatNumber(d.totalTokens)} tokens`);
-    output += "\n" + renderBox(dayLines, width, "Recent Days");
+  let legend = "";
+  let legendUsed = 0;
+  for (const segment of legendSegments) {
+    if (legendUsed >= legendLimit) break;
+    const text = segment.text.slice(0, legendLimit - legendUsed);
+    // Reset first so an earlier `dim` segment can't wash out this swatch.
+    legend += COLORS.reset + segment.color + text;
+    legendUsed += text.length;
   }
+  lines.push(" ".repeat(leftGutter) + legend + COLORS.reset);
 
-  const hourLines: string[] = [];
-  const maxHourCost = Math.max(...Array.from(hourlyMap.values()).map((h) => h.satsCost), 1);
-  const totalTodayCost = Math.max(todayStats.satsCost, 1);
-  const hourLabels: string[] = [];
-  for (let h = currentHour; h >= 0; h--) {
-    const hStat = hourlyMap.get(h);
-    const reqs = hStat?.requests || 0;
-    const cost = hStat?.satsCost || 0;
-    hourLabels.push(`${h.toString().padStart(2, "0")}:00 (${formatReqs(reqs)} req, ${formatCost(cost)} sats) `);
-  }
-  const maxHourLabel = Math.max(...hourLabels.map((l) => l.length));
-  startBarSection("hourly", maxHourLabel);
-  for (let i = currentHour; i >= 0; i--) {
-    const hStat = hourlyMap.get(i);
-    const reqs = hStat?.requests || 0;
-    const cost = hStat?.satsCost || 0;
-    hourLines.push(renderBarChart(
-      hourLabels[currentHour - i]!,
-      cost,
-      maxHourCost,
-      width - 4,
-      i === currentHour ? COLORS.green : COLORS.cyan,
-      (cost / totalTodayCost) * 100,
-      "hourly",
-    ));
-  }
-  endBarSection("hourly");
+  return lines;
+}
 
-  output += "\n" + renderBox(hourLines.length > 0 ? hourLines : ["No activity today yet"], width, "Hourly Activity");
+const HISTORY_WINDOW_LABELS: Record<TimeWindow, string> = {
+  all: "all time",
+  today: "last 24 hours",
+  "7d": "last 7 days",
+  "30d": "last 30 days",
+};
 
-  return output;
+const HISTORY_CHART_TITLES: Record<TimeWindow, string> = {
+  all: "Spend per week",
+  today: "Spend per hour",
+  "7d": "Spend per 6 hours",
+  "30d": "Spend per day",
+};
+
+export function renderHistory(stats: UsageStats, width: number, height?: number): string {
+  const win = stats.window;
+  const timeline = win.timeline ?? { bucket: "day" as const, points: [] };
+  const totals = win.totals;
+
+  const summaryLine =
+    COLORS.dim + "spent " + COLORS.reset + COLORS.green + formatCost(totals.satsCost) + " sats" + COLORS.reset +
+    COLORS.dim + "   reqs " + COLORS.reset + formatReqs(totals.requests) +
+    COLORS.dim + "   tokens " + COLORS.reset + formatNumber(totals.totalTokens) +
+    COLORS.dim + "   avg " + COLORS.reset +
+    formatCost(totals.requests > 0 ? totals.satsCost / totals.requests : 0) + " sats" + COLORS.reset;
+
+  // Fill the viewport: summary box (3) + chart box borders (2) + the chart's
+  // own headroom/axis/labels/legend (4) are chrome around the bar rows.
+  const chartHeight = height === undefined
+    ? 10
+    : Math.max(4, Math.min(40, height - 9));
+
+  const summary = renderBox([summaryLine], width, "History — " + HISTORY_WINDOW_LABELS[win.window]);
+  const chart = renderBox(
+    renderTimelineChart(timeline.points, timeline.bucket, width - 4, chartHeight),
+    width,
+    HISTORY_CHART_TITLES[win.window],
+  );
+  return summary + "\n" + chart;
 }
 
 export function renderModels(stats: UsageStats, width: number): string {
@@ -793,10 +943,10 @@ export function renderRecent(stats: UsageStats, width: number, naming: ClientNam
   return renderBox(lines, width, `Recent Requests (${stats.entries.length} shown)`);
 }
 
-export function renderTabContent(activeTab: TabId, stats: UsageStats, balance: BalanceInfo | null, status: StatusInfo | null, width: number, naming: ClientNaming): string {
+export function renderTabContent(activeTab: TabId, stats: UsageStats, balance: BalanceInfo | null, status: StatusInfo | null, width: number, naming: ClientNaming, activeWindow: TimeWindow, height?: number): string {
   switch (activeTab) {
-    case "overview": return renderOverview(stats, balance, status, width);
-    case "today": return renderToday(stats, width);
+    case "overview": return renderOverview(stats, balance, status, width, activeWindow);
+    case "history": return renderHistory(stats, width, height);
     case "models": return renderModels(stats, width);
     case "providers": return renderProviders(stats, width);
     case "tokens": return renderTokens(stats, width);

@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { renderBox, renderModels, renderNpubs, renderRecent, renderStackedBar, renderWindowBar, tokenSegments } from "./render.ts";
+import { renderBox, renderHistory, renderModels, renderNpubs, renderOverview, renderRecent, renderStackedBar, renderTimelineChart, renderWindowBar, renderWindowSelector, tokenSegments } from "./render.ts";
 import { stripAnsi } from "./terminal.ts";
 import { COLORS } from "./constants.ts";
 import { buildClientNaming, resolveClientLabel, type ClientInfo, type NpubEntry } from "./data.ts";
-import type { UsageStats } from "./types.ts";
+import type { TimelinePoint, UsageStats } from "./types.ts";
 
 const NPUB = "npub1abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopq";
 
@@ -49,6 +49,7 @@ function statsFor(npub: string): UsageStats {
         large: { count: 0, cost: 0 },
         huge: { count: 0, cost: 0 },
       },
+      timeline: { bucket: "day", points: [] },
     },
   };
 }
@@ -285,10 +286,84 @@ describe("renderWindowBar", () => {
   });
 
   test("is hidden on tabs that ignore the window", () => {
-    for (const tab of ["overview", "today", "recent"] as const) {
+    for (const tab of ["overview", "recent"] as const) {
       expect(renderWindowBar("7d", tab)).toBe("");
     }
     expect(stripAnsi(renderWindowBar("7d", "tokens"))).toContain("window:");
+    // History is driven by the window (its chart re-buckets per range).
+    expect(stripAnsi(renderWindowBar("7d", "history"))).toContain("window:");
+  });
+
+  test("leaves the chrome to the tabs that render it inline", () => {
+    // Overview still honours the window; only the chrome bar is dropped.
+    expect(renderWindowBar("7d", "overview")).toBe("");
+    expect(stripAnsi(renderWindowSelector("7d"))).toContain("7d");
+    expect(stripAnsi(renderWindowSelector("7d"))).toContain("[W] cycle");
+  });
+});
+
+describe("renderOverview", () => {
+  const balance = { keys: [{ id: "wallet", name: "Wallet", balance: 1000 }], total: 1000, unit: "sat" as const, apikeysCalled: 0 };
+
+  /** All-time figures differ from the windowed ones so each is identifiable. */
+  const windowedStats = {
+    ...statsFor(NPUB),
+    totalEntries: 888,
+    totalSatsCost: 7777,
+    summary: {
+      totals: { requests: 888, promptTokens: 0, completionTokens: 0, totalTokens: 0, cost: 0, satsCost: 7777 },
+      models: [],
+      clients: [],
+    },
+    window: {
+      window: "7d",
+      totals: { requests: 5, promptTokens: 100, completionTokens: 50, totalTokens: 150, cost: 0, satsCost: 12.34 },
+      models: [{ modelId: "windowed-model", requests: 5, promptTokens: 100, completionTokens: 50, totalTokens: 150, cost: 0, satsCost: 12.34 }],
+      providers: [],
+      clients: [{ client: "pi-agent", requests: 5, promptTokens: 100, completionTokens: 50, totalTokens: 150, cost: 0, satsCost: 12.34, topModels: [] }],
+      npubs: [],
+      sizeBuckets: {
+        tiny: { count: 0, cost: 0 },
+        small: { count: 0, cost: 0 },
+        medium: { count: 0, cost: 0 },
+        large: { count: 0, cost: 0 },
+        huge: { count: 0, cost: 0 },
+      },
+    },
+  } as unknown as UsageStats;
+
+  test("scopes every total to the active window", () => {
+    const out = stripAnsi(renderOverview(windowedStats, balance, null, 120, "7d"));
+
+    expect(out).toContain("12.34 sats");
+    expect(out).toContain("Total Requests: 5");
+    expect(out).toContain("windowed-model");
+    expect(out).toContain("pi-agent");
+    // The all-time figures are not shown on the Overview tab.
+    expect(out).not.toContain("7.78k");
+    expect(out).not.toContain("888");
+  });
+
+  test("renders the window selector directly under the Balance box", () => {
+    const out = renderOverview(windowedStats, balance, null, 120, "7d");
+    const lines = stripAnsi(out).split("\n");
+
+    const balanceIdx = lines.findIndex((line) => line.includes("Balance"));
+    const windowIdx = lines.findIndex((line) => line.includes("Time Window"));
+    const statsIdx = lines.findIndex((line) => line.includes("Stats of Sats"));
+
+    expect(balanceIdx).toBeGreaterThanOrEqual(0);
+    expect(windowIdx).toBeGreaterThan(balanceIdx);
+    expect(statsIdx).toBeGreaterThan(windowIdx);
+    // The selected window is the highlighted one.
+    expect(out).toContain(`${COLORS.bgGreen}${COLORS.bold} 7d ${COLORS.reset}`);
+  });
+
+  test("renders the selector even without balance data", () => {
+    const out = stripAnsi(renderOverview(windowedStats, null, null, 120, "all"));
+
+    expect(out).toContain("Time Window");
+    expect(out).toContain("Status unavailable");
   });
 });
 
@@ -319,6 +394,122 @@ describe("windowed rendering", () => {
     const out = stripAnsi(renderModels(stats, 100));
     expect(out).toContain("windowed-model");
     expect(out).not.toContain("all-time-model");
+  });
+});
+
+const TIMELINE_POINTS: TimelinePoint[] = [
+  { key: "00", timestamp: 0, requests: 1, satsCost: 10, totalTokens: 100, promptTokens: 60, completionTokens: 40 },
+  { key: "01", timestamp: 1, requests: 2, satsCost: 30, totalTokens: 400, promptTokens: 300, completionTokens: 100 },
+  { key: "02", timestamp: 2, requests: 0, satsCost: 0, totalTokens: 0, promptTokens: 0, completionTokens: 0 },
+  { key: "03", timestamp: 3, requests: 3, satsCost: 20, totalTokens: 50, promptTokens: 30, completionTokens: 20 },
+];
+
+describe("renderTimelineChart", () => {
+  test("draws grouped spend/token bars with dual axes and a legend", () => {
+    const lines = stripAnsi(renderTimelineChart(TIMELINE_POINTS, "hour", 60).join("\n")).split("\n");
+    const text = lines.join("\n");
+
+    // Default height 10 + headroom + bottom axis + x labels + legend.
+    expect(lines).toHaveLength(14);
+    expect(lines[0]).toContain("50"); // rounded sats ceiling (left axis)
+    expect(lines[0]).toContain("500"); // rounded token ceiling (right axis)
+    expect(lines[0]).not.toContain("█"); // headroom row carries ticks only
+    expect(text).toContain("00");
+    expect(text).toContain("03");
+    expect(text).toContain("spend");
+    expect(text).toContain("left: sats · right: tokens");
+    // The all-zero bucket has no bars while its neighbours do.
+    expect(text).toContain("█");
+  });
+
+  test("rounds both axis ceilings up instead of using the exact peaks", () => {
+    const points = [{ ...TIMELINE_POINTS[0]!, satsCost: 8900, totalTokens: 8_900_000 }];
+    const lines = renderTimelineChart(points, "hour", 76, 10).map(stripAnsi);
+    expect(lines[0]).toContain("10.0k");
+    expect(lines[0]).toContain("10.0M");
+    expect(lines[0]).not.toContain("8.9");
+    expect(lines[1]).not.toContain("█"); // 89% of the rounded scale
+    expect(lines[2]).toContain("█");
+    expect(lines[5]).toContain("5.0k");
+    expect(lines[5]).toContain("5.0M");
+  });
+
+  test("scales merged buckets against their summed peaks at narrow widths", () => {
+    const points = Array.from({ length: 28 }, (_, i) => ({
+      ...TIMELINE_POINTS[0]!, key: String(i), timestamp: i,
+      satsCost: i < 2 ? 10 : 6, totalTokens: i < 2 ? 100 : 60,
+    }));
+    const lines = renderTimelineChart(points, "hour", 76, 10).map(stripAnsi);
+    expect(lines[0]).toContain("20");
+    expect(lines[0]).toContain("200");
+    const plotRows = lines.slice(1, 11).map((line) => line.split("┤")[1]!.split("├")[0]!);
+    // Two adjacent original buckets become one pair: 20/200 vs 12/120.
+    expect(plotRows.filter((row) => row[0] === "█")).toHaveLength(10);
+    expect(plotRows.filter((row) => row[1] === "█")).toHaveLength(10);
+    expect(plotRows.filter((row) => row[4] === "█")).toHaveLength(6);
+    expect(plotRows.filter((row) => row[5] === "█")).toHaveLength(6);
+    for (const line of lines) expect(line.length).toBeLessThanOrEqual(76);
+  });
+
+  test("labels day/week buckets as MM-DD", () => {
+    const weeks: TimelinePoint[] = [
+      { key: "2026-01-05", timestamp: 0, requests: 1, satsCost: 5, totalTokens: 10, promptTokens: 5, completionTokens: 5 },
+      { key: "2026-01-12", timestamp: 1, requests: 1, satsCost: 5, totalTokens: 10, promptTokens: 5, completionTokens: 5 },
+    ];
+    const text = stripAnsi(renderTimelineChart(weeks, "week", 60).join("\n"));
+    expect(text).toContain("01-05");
+    expect(text).toContain("01-12");
+  });
+
+  test("reports an empty window instead of drawing", () => {
+    expect(renderTimelineChart([], "day", 60)).toEqual(["No activity in this window"]);
+    const zeroed: TimelinePoint[] = [
+      { key: "00", timestamp: 0, requests: 0, satsCost: 0, totalTokens: 0, promptTokens: 0, completionTokens: 0 },
+    ];
+    expect(renderTimelineChart(zeroed, "hour", 60)).toEqual(["No activity in this window"]);
+  });
+});
+
+describe("renderHistory", () => {
+  const stats = {
+    ...statsFor(NPUB),
+    window: {
+      window: "today",
+      totals: { requests: 128, promptTokens: 57_300_000, completionTokens: 24_600_000, totalTokens: 81_900_000, cost: 0, satsCost: 11_700 },
+      models: [],
+      providers: [],
+      clients: [],
+      npubs: [],
+      sizeBuckets: {
+        tiny: { count: 0, cost: 0 },
+        small: { count: 0, cost: 0 },
+        medium: { count: 0, cost: 0 },
+        large: { count: 0, cost: 0 },
+        huge: { count: 0, cost: 0 },
+      },
+      timeline: { bucket: "hour", points: TIMELINE_POINTS },
+    },
+  } as unknown as UsageStats;
+
+  test("shows the window totals above the spend/token chart", () => {
+    const out = stripAnsi(renderHistory(stats, 100));
+    expect(out).toContain("History — last 24 hours");
+    expect(out).toContain("spent");
+    expect(out).toContain("11.70k sats");
+    expect(out).toContain("Spend per hour");
+    expect(out).toContain("left: sats · right: tokens");
+  });
+
+  test("grows the chart to fill the requested height", () => {
+    expect(stripAnsi(renderHistory(stats, 100, 20)).split("\n")).toHaveLength(20);
+    expect(stripAnsi(renderHistory(stats, 100, 40)).split("\n")).toHaveLength(40);
+  });
+
+  test("keeps every rendered line at the requested width", () => {
+    for (const width of [120, 100, 80, 60, 40]) {
+      const lines = stripAnsi(renderHistory(stats, width)).split("\n");
+      expect(lines.map((line) => line.length)).toEqual(lines.map(() => width));
+    }
   });
 });
 
@@ -353,6 +544,16 @@ describe("renderBox", () => {
     for (const width of visibleWidths(box)) {
       expect(width).toBe(30);
     }
+  });
+
+  test("truncates overlong content lines instead of breaking the border", () => {
+    const long = "x".repeat(100);
+    const box = renderBox([long, "short"], 30);
+
+    for (const width of visibleWidths(box)) {
+      expect(width).toBe(30);
+    }
+    expect(stripAnsi(box)).toContain("x".repeat(26));
   });
 
   test("composes two half-width boxes into rows of the full width", () => {

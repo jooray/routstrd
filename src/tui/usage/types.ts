@@ -3,9 +3,12 @@ import type {
   TimeWindow,
   UsageSummary,
   WindowedStats,
+  Timeline,
+  TimelineBucket,
+  TimelinePoint,
 } from "../../daemon/http/usage-summary.ts";
 
-export type { UsageSummary, TimeWindow, WindowedStats };
+export type { UsageSummary, TimeWindow, WindowedStats, Timeline, TimelineBucket, TimelinePoint };
 
 export interface UpdateInfo {
   hasUpdate: boolean;
@@ -19,11 +22,13 @@ export interface UsageStats {
   recentSatsCost: number;
   limit: number;
   summary: UsageSummary;
+  /** False when connected to a daemon without selectable-window summaries. */
+  supportsWindows?: boolean;
   /** Aggregates for the currently selected time window. */
   window: WindowedStats;
 }
 
-export type TabId = "overview" | "today" | "models" | "providers" | "tokens" | "clients" | "npubs" | "recent";
+export type TabId = "overview" | "history" | "models" | "providers" | "tokens" | "clients" | "npubs" | "recent";
 
 export interface Tab {
   id: TabId;

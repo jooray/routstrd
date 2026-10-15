@@ -12,7 +12,9 @@ import type { RequestResponseLogSink } from "../request-response-log-sink";
 import { getEncodedToken } from "@cashu/coco-core";
 import type { HistoryEntry } from "@cashu/coco-core";
 import { logger } from "../../utils/logger";
-import { loadDaemonConfig, saveDaemonConfig } from "../config-store";
+import { VERSION } from "../../version";
+import { isUpdateStateApplicable, readUpdateState, type UpdateState } from "../../utils/update-state";
+import { loadDaemonConfig, loadDaemonConfigSync, saveDaemonConfig } from "../config-store";
 import {
   WalletHttpError,
   type WalletClient,
@@ -445,6 +447,9 @@ export function createDaemonRequestHandler(deps: {
   providerManager: ProviderManager;
   refundClient: any;
   requestResponseLogSink?: RequestResponseLogSink;
+  /** Reads the cached update state for GET /version; defaults to the on-disk cache. */
+  loadUpdateState?: () => UpdateState | null;
+  updateChecksEnabled?: () => boolean;
 }) {
   return async function handler(req: IncomingMessage, res: ServerResponse) {
     const host = req.headers.host || "localhost";
@@ -476,6 +481,25 @@ export function createDaemonRequestHandler(deps: {
     if (req.method === "GET" && url.pathname === "/status") {
       const output = await buildStatusOutput(deps);
       sendJson(res, 200, { output });
+      return;
+    }
+
+    // Version of the running daemon plus the cached result of its last
+    // background update check. Read-only and cheap: the daemon refreshes the
+    // cache on its own schedule, so CLI/TUI clients just read it.
+    if (req.method === "GET" && url.pathname === "/version") {
+      const state = (deps.loadUpdateState ?? readUpdateState)();
+      const enabled = (deps.updateChecksEnabled ??
+        (() => loadDaemonConfigSync().updateCheck !== false))();
+      sendJson(res, 200, {
+        output: {
+          version: VERSION,
+          current: VERSION,
+          latest: state?.latest ?? null,
+          hasUpdate: enabled && !!state && isUpdateStateApplicable(state, VERSION),
+          checkedAt: state?.checkedAt ?? null,
+        },
+      });
       return;
     }
 
@@ -1299,8 +1323,13 @@ export function createDaemonRequestHandler(deps: {
           return;
         }
 
+        const baseUrlsList: string[] = deps.store.getState().baseUrlsList || [];
+        // Label matching can await relay evidence. Resolve it before reading
+        // manual overrides so concurrent index edits cannot be overwritten.
+        const labelMatch = hasLabels
+          ? await deps.modelManager.matchProviderUrlsByLabels(labels, baseUrlsList)
+          : null;
         const state = deps.store.getState();
-        const baseUrlsList: string[] = state.baseUrlsList || [];
         // User-driven disables belong in the *manual* disabled list. The
         // review-based list (setDisabledProviders) is owned by the Nostr
         // kind-38425 review sync, which overwrites it and would otherwise
@@ -1333,16 +1362,12 @@ export function createDaemonRequestHandler(deps: {
           }
         }
 
-        // 2) Review labels: drop the label from the SDK's enabled set, so the
-        // review verdict applies again and the matching providers go back to
-        // their Nostr state (disabled unless they carry another enabled label).
+        // 2) Review labels: remove user opt-ins. Default labels, other enabled
+        // labels and manual overrides can keep matching providers enabled.
         let matchedLabels: string[] = [];
         let unmatchedLabels: string[] = [];
-        if (hasLabels) {
-          const match = await deps.modelManager.matchProviderUrlsByLabels(
-            labels,
-            baseUrlsList,
-          );
+        if (hasLabels && labelMatch) {
+          const match = labelMatch;
           matchedLabels = match.matchedLabels;
           unmatchedLabels = match.unmatchedLabels;
           for (const label of labels) {
@@ -1353,10 +1378,14 @@ export function createDaemonRequestHandler(deps: {
           }
         }
 
-        deps.store.getState().setManuallyDisabledProviders(manuallyDisabledProviders);
-        deps.discoveryAdapter.setManuallyDisabledProviders(manuallyDisabledProviders);
-        deps.store.getState().setManuallyEnabledProviders(manuallyEnabledProviders);
-        deps.discoveryAdapter.setManuallyEnabledProviders(manuallyEnabledProviders);
+        // Label policy never changes per-provider manual overrides. Keep index
+        // mutations and their replacement writes synchronous after matching.
+        if (hasIndices && indices.length > 0) {
+          deps.store.getState().setManuallyDisabledProviders(manuallyDisabledProviders);
+          deps.discoveryAdapter.setManuallyDisabledProviders(manuallyDisabledProviders);
+          deps.store.getState().setManuallyEnabledProviders(manuallyEnabledProviders);
+          deps.discoveryAdapter.setManuallyEnabledProviders(manuallyEnabledProviders);
+        }
 
         // Recompute the review verdict so a label-based disable takes effect now.
         const reviewed =
@@ -1365,9 +1394,17 @@ export function createDaemonRequestHandler(deps: {
           deps.store.getState().setDisabledProviders(reviewed);
         }
 
-        const parts = [`Disabled ${toDisable.length} provider(s)`];
-        if (matchedLabels.length > 0) {
-          parts.push(`by label: ${matchedLabels.join(", ")}`);
+        // Label matches are targets, not proof of an effective policy change.
+        // Report current state after sync, including preserved manual overrides.
+        const effectiveDisabled = new Set<string>(deps.discoveryAdapter.getDisabledProviders());
+        const disabled = toDisable.filter((url) => effectiveDisabled.has(url));
+        const remainingEnabled = toDisable.filter((url) => !effectiveDisabled.has(url));
+        const parts = [`${disabled.length} targeted provider(s) currently disabled.`];
+        if (hasLabels) {
+          parts.push(`Review-label opt-out requested: ${labels.join(", ")}. Manual overrides and default labels are preserved.`);
+        }
+        if (remainingEnabled.length > 0) {
+          parts.push(`${remainingEnabled.length} targeted provider(s) remain enabled under the effective policy.`);
         }
 
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -1375,9 +1412,13 @@ export function createDaemonRequestHandler(deps: {
           JSON.stringify({
             output: {
               message: parts.join(" "),
-              disabled: toDisable,
+              disabled,
+              remainingEnabled,
+              matchedUrls: labelMatch?.matchedUrls ?? [],
               enabledLabels:
                 deps.modelManager.getUserEnabledReviewLabels?.() ?? [],
+              enabledReviewLabels:
+                deps.modelManager.getEnabledReviewLabels?.() ?? [],
               ...(matchedLabels.length > 0 ? { matchedLabels } : {}),
               ...(unmatchedLabels.length > 0 ? { unmatchedLabels } : {}),
             },
@@ -1414,8 +1455,13 @@ export function createDaemonRequestHandler(deps: {
           return;
         }
 
+        const baseUrlsList: string[] = deps.store.getState().baseUrlsList || [];
+        // Label matching can await relay evidence. Resolve it before reading
+        // manual overrides so concurrent index edits cannot be overwritten.
+        const labelMatch = hasLabels
+          ? await deps.modelManager.matchProviderUrlsByLabels(labels, baseUrlsList)
+          : null;
         const state = deps.store.getState();
-        const baseUrlsList: string[] = state.baseUrlsList || [];
         // Re-enabling by index clears the manual disable and records a
         // manual-enable override so the review sync (which disables providers
         // without an lgtm review) does not silently re-disable it.
@@ -1458,11 +1504,8 @@ export function createDaemonRequestHandler(deps: {
         // later. `sandbox` is off until a user opts it in here.
         let matchedLabels: string[] = [];
         let unmatchedLabels: string[] = [];
-        if (hasLabels) {
-          const match = await deps.modelManager.matchProviderUrlsByLabels(
-            labels,
-            baseUrlsList,
-          );
+        if (hasLabels && labelMatch) {
+          const match = labelMatch;
           matchedLabels = match.matchedLabels;
           unmatchedLabels = match.unmatchedLabels;
           for (const label of labels) {
@@ -1473,10 +1516,14 @@ export function createDaemonRequestHandler(deps: {
           }
         }
 
-        deps.store.getState().setManuallyDisabledProviders(manuallyDisabledProviders);
-        deps.discoveryAdapter.setManuallyDisabledProviders(manuallyDisabledProviders);
-        deps.store.getState().setManuallyEnabledProviders(manuallyEnabledProviders);
-        deps.discoveryAdapter.setManuallyEnabledProviders(manuallyEnabledProviders);
+        // Label policy never changes per-provider manual overrides. Keep index
+        // mutations and their replacement writes synchronous after matching.
+        if (hasIndices && indices.length > 0) {
+          deps.store.getState().setManuallyDisabledProviders(manuallyDisabledProviders);
+          deps.discoveryAdapter.setManuallyDisabledProviders(manuallyDisabledProviders);
+          deps.store.getState().setManuallyEnabledProviders(manuallyEnabledProviders);
+          deps.discoveryAdapter.setManuallyEnabledProviders(manuallyEnabledProviders);
+        }
 
         // Recompute the review verdict so a label-based enable takes effect
         // now rather than on the next scheduled review pass.
@@ -1486,9 +1533,17 @@ export function createDaemonRequestHandler(deps: {
           deps.store.getState().setDisabledProviders(reviewed);
         }
 
-        const parts = [`Enabled ${toEnable.length} provider(s)`];
-        if (matchedLabels.length > 0) {
-          parts.push(`by label: ${matchedLabels.join(", ")}`);
+        // Label matches are targets, not proof of an effective policy change.
+        // Report current state after sync, including preserved manual overrides.
+        const effectiveDisabled = new Set<string>(deps.discoveryAdapter.getDisabledProviders());
+        const enabled = toEnable.filter((url) => !effectiveDisabled.has(url));
+        const remainingDisabled = toEnable.filter((url) => effectiveDisabled.has(url));
+        const parts = [`${enabled.length} targeted provider(s) currently enabled.`];
+        if (hasLabels) {
+          parts.push(`Review-label opt-in requested: ${labels.join(", ")}. Manual overrides and default labels are preserved.`);
+        }
+        if (remainingDisabled.length > 0) {
+          parts.push(`${remainingDisabled.length} targeted provider(s) remain disabled under the effective policy.`);
         }
 
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -1496,9 +1551,13 @@ export function createDaemonRequestHandler(deps: {
           JSON.stringify({
             output: {
               message: parts.join(" "),
-              enabled: toEnable,
+              enabled,
+              remainingDisabled,
+              matchedUrls: labelMatch?.matchedUrls ?? [],
               enabledLabels:
                 deps.modelManager.getUserEnabledReviewLabels?.() ?? [],
+              enabledReviewLabels:
+                deps.modelManager.getEnabledReviewLabels?.() ?? [],
               ...(matchedLabels.length > 0 ? { matchedLabels } : {}),
               ...(unmatchedLabels.length > 0 ? { unmatchedLabels } : {}),
             },
@@ -2041,10 +2100,13 @@ export function createDaemonRequestHandler(deps: {
               .filter((c) => c.ownerNpub === npubFilter)
               .map((c) => c.clientId)
           : undefined;
-        const output = await deps.usageTrackingDriver.list({
-          limit: parseLimit(url.searchParams.get("limit")),
-          ...(clientFilter ? { clients: clientFilter } : {}),
-        });
+        // An unmatched owner is an empty selection, not an unfiltered query.
+        const output = clientFilter?.length === 0
+          ? []
+          : await deps.usageTrackingDriver.list({
+              limit: parseLimit(url.searchParams.get("limit")),
+              ...(clientFilter ? { clients: clientFilter } : {}),
+            });
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ output }));
       } catch (error) {
@@ -2057,6 +2119,18 @@ export function createDaemonRequestHandler(deps: {
       try {
         const tz = Number.parseInt(url.searchParams.get("tz") || "0", 10) || 0;
         const window = parseTimeWindow(url.searchParams.get("window"));
+        const requestedTimeZone = url.searchParams.get("timezone")?.trim();
+        let timeZone: string | undefined;
+        if (requestedTimeZone) {
+          try {
+            timeZone = new Intl.DateTimeFormat("en-US", {
+              timeZone: requestedTimeZone,
+            }).resolvedOptions().timeZone;
+          } catch {
+            sendJson(res, 400, { error: "Invalid 'timezone': expected an IANA timezone." });
+            return;
+          }
+        }
         const npubFilter = url.searchParams.get("npub")?.trim();
         const clients = getClientsFromStore(deps.store);
         const clientFilter = npubFilter
@@ -2064,7 +2138,7 @@ export function createDaemonRequestHandler(deps: {
               .filter((c) => c.ownerNpub === npubFilter)
               .map((c) => c.clientId)
           : undefined;
-        const summary = await getUsageSummary(deps.usageTrackingDriver, clients, tz, clientFilter, window);
+        const summary = await getUsageSummary(deps.usageTrackingDriver, clients, tz, clientFilter, window, timeZone);
         sendJson(res, 200, { output: summary });
       } catch (error) {
         sendJson(res, 500, { error: toErrorMessage(error) });

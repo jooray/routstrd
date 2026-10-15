@@ -20,6 +20,7 @@ import {
   REQUEST_RESPONSE_LOGS_DIR,
 } from "../utils/config";
 import { logger } from "../utils/logger";
+import { createUpdateCheckJob } from "./update-check-job";
 
 
 function makeSdkLogger(prefix?: string): SdkLogger {
@@ -405,6 +406,12 @@ export async function runDaemon(argv: string[] = process.argv): Promise<void> {
     }
   };
 
+  // Low-frequency background update check. It only caches the answer in
+  // update-state.json for the CLI/TUI to read; it never installs anything.
+  const updateCheckJob = createUpdateCheckJob({
+    enabled: () => loadDaemonConfigSync().updateCheck !== false,
+  });
+
   let walletDisposePromise: Promise<void> | undefined;
   const disposeWallet = (): Promise<void> => {
     walletDisposePromise ??= walletClient.dispose?.() || Promise.resolve();
@@ -414,6 +421,7 @@ export async function runDaemon(argv: string[] = process.argv): Promise<void> {
   server.on("close", () => {
     stopModelRefreshJob();
     stopRefundJob();
+    updateCheckJob.stop();
     void disposeWallet().catch((error) => {
       logger.error("Failed to dispose wallet:", error);
     });
@@ -450,41 +458,40 @@ export async function runDaemon(argv: string[] = process.argv): Promise<void> {
     void ensureProvidersBootstrapped()
       .then(async () => {
         const initialRefreshStartedAt = Date.now();
-        // Catch up on any Nostr events published since last run
-        logger.debug("Running initial Nostr event refresh...");
-        await modelManager.refreshNostrEvents();
-
+        // Bootstrap already refreshed expired provider/review/mapping/model
+        // evidence. Reuse it here; scheduled and explicit refreshes still force
+        // network discovery. Do not immediately query every relay twice.
         startModelRefreshJob();
         startRefundJob();
+        updateCheckJob.start();
         // Run an immediate refresh to populate models right away. Client
         // integrations are skipped when the scheduled job is disabled, so a
         // restart does not overwrite hand-edited client configs.
-        if (readAutoRefreshSettings().enabled) {
-          logger.debug("Running initial model refresh...");
-          const result = await refreshModelsAndIntegrations(
-            getRoutstr21Models,
-            updatedConfig,
+        const result = await refreshModelsAndIntegrations(
+          // Check provider TTLs even with a persisted warm cache; ordinary
+          // model-list readers still serve stale models without this wait.
+          (force) => getRoutstr21Models(force, true),
+          updatedConfig,
+          "Initial",
+          {
+            forceRefresh: false,
+            refreshIntegrations: readAutoRefreshSettings().enabled,
+          },
+        );
+        logger.log(
+          formatModelRefreshSummary(
             "Initial",
-          );
-          logger.log(
-            formatModelRefreshSummary(
-              "Initial",
-              result,
-              Date.now() - initialRefreshStartedAt,
-            ),
-          );
-        } else {
-          logger.debug(
-            "Running initial model refresh (client integrations skipped)...",
-          );
-          await getRoutstr21Models(true);
-        }
+            result,
+            Date.now() - initialRefreshStartedAt,
+          ),
+        );
       })
       .catch((error) => {
         logger.error("Initial model refresh failed:", error);
         // Still start the jobs even if initial refresh fails
         startModelRefreshJob();
         startRefundJob();
+        updateCheckJob.start();
       });
   });
 }

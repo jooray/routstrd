@@ -59,6 +59,49 @@ export async function fetchStatus(): Promise<StatusInfo | null> {
   }
 }
 
+export interface VersionInfo {
+  /** Version of the daemon that served this response. */
+  version: string;
+  current: string;
+  latest: string | null;
+  hasUpdate: boolean;
+  checkedAt: string | null;
+}
+
+/**
+ * Read the daemon's cached update state from GET /version. The daemon keeps it
+ * fresh on a low-frequency background schedule, so this is a cheap local read
+ * rather than a registry/GitHub call. Returns null when the endpoint is
+ * unavailable (e.g. an older daemon), letting callers fall back.
+ */
+export async function fetchVersionInfo(): Promise<VersionInfo | null> {
+  try {
+    const result = await callDaemon("/version");
+    if (result.error) return null;
+
+    const output = result.output as
+      | {
+          version?: string;
+          current?: string;
+          latest?: string | null;
+          hasUpdate?: boolean;
+          checkedAt?: string | null;
+        }
+      | undefined;
+    if (!output?.version) return null;
+
+    return {
+      version: output.version,
+      current: output.current ?? output.version,
+      latest: output.latest ?? null,
+      hasUpdate: output.hasUpdate === true,
+      checkedAt: output.checkedAt ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchBalance(): Promise<BalanceInfo | null> {
   try {
     const result = await callDaemon("/keys/balance");
@@ -82,10 +125,15 @@ export async function fetchBalance(): Promise<BalanceInfo | null> {
   }
 }
 
-export async function fetchUsageSummary(windowId: TimeWindow = "all"): Promise<UsageStats | null> {
+export async function fetchUsageSummary(
+  windowId: TimeWindow = "all",
+  request: typeof callDaemon = callDaemon,
+): Promise<UsageStats | null> {
   try {
     const tz = new Date().getTimezoneOffset();
-    const result = await callDaemon(`/usage/summary?tz=${tz}&window=${windowId}`);
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const timezoneQuery = timeZone ? `&timezone=${encodeURIComponent(timeZone)}` : "";
+    const result = await request(`/usage/summary?tz=${tz}&window=${windowId}${timezoneQuery}`);
     if (result.error) return null;
 
     const summary = result.output as UsageSummary | undefined;
@@ -98,6 +146,7 @@ export async function fetchUsageSummary(windowId: TimeWindow = "all"): Promise<U
       recentSatsCost: summary.totals.satsCost,
       limit: 50,
       summary,
+      supportsWindows: Boolean(summary.window),
       window: summary.window ?? windowFromAllTime(summary),
     };
   } catch {
@@ -118,6 +167,8 @@ function windowFromAllTime(summary: UsageSummary): WindowedStats {
     clients: summary.clients,
     npubs: summary.npubs,
     sizeBuckets: summary.sizeBuckets,
+    // No timeline on old daemons; the History tab falls back to an empty chart.
+    timeline: { bucket: "day", points: [] },
   };
 }
 

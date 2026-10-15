@@ -310,7 +310,26 @@ in place; npm/bun installs are updated through the package manager.
 `routstrd start` and `routstrd restart` also check for a newer version first and
 prompt `Update now? [Y/n]` (yes is the default) before bringing the daemon up.
 The check runs only on an interactive terminal, so scripts, CI and PM2 are
-unaffected; set `ROUTSTRD_NO_UPDATE_CHECK=1` to skip it entirely.
+unaffected; set `"updateCheck": false` in `config.json` to skip it entirely.
+
+The running daemon also checks for updates on its own, slowly (every 6 hours;
+first pass ~30s after startup) and caches the answer in
+`~/.routstrd/update-state.json`. `GET /version` exposes that cache, the TUI reads
+it for its update banner, and after any other command (e.g. `balance`, `send`,
+`receive`) the CLI prints a one-line notice to stderr:
+
+```
+A new routstrd version is available (v0.4.14 → v0.5.0). Run 'routstrd update' to update.
+```
+
+The notice is read from disk (no network call) and is skipped for commands that
+manage updates themselves or own the terminal (`update`, `start`, `restart`,
+`stop`, `daemon`, `monitor`, `top`, `service ...`). Set `"updateCheck": false`
+in the existing `config.json` to disable automatic checks, startup prompts,
+CLI notices, and the TUI banner together. This Boolean defaults to true;
+`routstrd update` still works explicitly. Failed lookups preserve the last
+successful cache. Notices require a matching running version and expire after
+24 hours.
 
 ### `routstrd mode`
 
@@ -327,9 +346,13 @@ Changing mode restarts the daemon automatically.
 Open an interactive TUI (htop-like) for usage monitoring. `top` is an alias.
 
 Press `W` to cycle the stats time window (`All` → `24h` → `7d` → `30d`). The
-window applies to the **Models**, **Providers**, **Tokens**, **Clients** and
-**Npubs** tabs. **Overview**, **Today** and **Recent** keep their own
-all-time/today granularity, and the selector is marked `n/a` on those tabs.
+window applies to the **Overview**, **History**, **Models**, **Providers**,
+**Tokens**, **Clients** and **Npubs** tabs. On **Overview** the selector is
+drawn inside the tab, directly under the Balance box, and scopes the totals and
+the model and client breakdowns. On **History** it chooses the chart's bucket —
+hours for `24h` and `7d`, days for `30d`, and ISO weeks for `All` — where spend
+and tokens are drawn as grouped bars against left (sats) and right (tokens)
+axes. **Recent** keeps its own all-time view and hides the selector.
 
 ### `routstrd logs`
 
@@ -493,6 +516,28 @@ The daemon exposes an OpenAI-compatible HTTP API at `http://localhost:8008`:
 ### `GET /health`
 
 Health check endpoint.
+
+### `GET /version`
+
+Version of the running daemon plus the cached result of its last background
+update check:
+
+```json
+{
+  "output": {
+    "version": "0.4.14",
+    "current": "0.4.14",
+    "latest": "0.5.0",
+    "hasUpdate": true,
+    "checkedAt": "2026-01-02T03:04:05.000Z"
+  }
+}
+```
+
+Read-only and cheap — the daemon refreshes the cache on its own schedule, so
+clients read the cache. For older daemons without this endpoint, the TUI
+fallback checks npm/GitHub at most every 210 minutes (cached endpoint reads
+remain every 5 minutes).
 
 ### `GET /v1/models`
 
