@@ -152,8 +152,11 @@ export async function callDaemonUrl(
     ? new TextEncoder().encode(bodyString)
     : undefined;
 
+  // A local daemon shares this config.json and accepts NIP-98 signed by its
+  // nsec on management routes; a remote one (via routstrd-auth) checks the
+  // npub against its own list.
   let authorization: string | undefined;
-  if ((config.daemonUrl || config.authUrl) && config.nsec) {
+  if (config.nsec) {
     const secretKey = parseSecretKey(config.nsec);
     authorization = await createNIP98Authorization(
       secretKey,

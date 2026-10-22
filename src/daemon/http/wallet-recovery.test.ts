@@ -4,7 +4,7 @@ import { createDaemonRequestHandler } from "./index";
 
 async function recover(body: unknown) {
   const recoverMintQuotes = mock(async (_options: unknown) => ({ recovered: 0 }));
-  const handler = createDaemonRequestHandler({ walletClient: { recoverMintQuotes } } as never);
+  const handler = createDaemonRequestHandler({ authenticateManagement: async () => null, walletClient: { recoverMintQuotes } } as never);
   const req = new EventEmitter() as any;
   Object.assign(req, { method: "POST", url: "/wallet/recover", headers: { host: "localhost" } });
   const res = {
@@ -56,7 +56,7 @@ async function recoverOperations() {
     failed: 0,
     skippedMints: {},
   }));
-  const handler = createDaemonRequestHandler({ walletClient: { recoverStuckOperations } } as never);
+  const handler = createDaemonRequestHandler({ authenticateManagement: async () => null, walletClient: { recoverStuckOperations } } as never);
   const req = new EventEmitter() as any;
   Object.assign(req, { method: "POST", url: "/wallet/recover/operations", headers: { host: "localhost" } });
   const res = {
@@ -81,7 +81,7 @@ describe("POST /wallet/recover/operations", () => {
   });
 
   it("returns 501 when the wallet client does not support it", async () => {
-    const handler = createDaemonRequestHandler({ walletClient: {} } as never);
+    const handler = createDaemonRequestHandler({ authenticateManagement: async () => null, walletClient: {} } as never);
     const req = new EventEmitter() as any;
     Object.assign(req, { method: "POST", url: "/wallet/recover/operations", headers: { host: "localhost" } });
     const res = {

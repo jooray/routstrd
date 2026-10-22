@@ -14,6 +14,7 @@ import { ModelManager } from "@routstr/sdk/bun";
 import type { SdkLogger } from "@routstr/sdk";
 import {
   CONFIG_DIR,
+  CONFIG_FILE,
   DB_PATH,
   SOCKET_PATH,
   PID_FILE,
@@ -53,6 +54,9 @@ import { createWalletAdapter } from "./wallet";
 import type { AutoRefillConfig } from "./wallet/auto-refill";
 import { createModelService } from "./models";
 import { createDaemonRequestHandler } from "./http";
+import { createNip98ManagementAuth } from "./http/management-auth";
+import { generateSecretKey, getPublicKey, nip19 } from "nostr-tools";
+import { parseSecretKey } from "../utils/nip98";
 import { FileRequestResponseLogSink } from "./request-response-log-sink";
 import { formatModelRefreshSummary, refreshModelsAndIntegrations } from "../integrations";
 import { RoutstrClient } from "@routstr/sdk";
@@ -110,7 +114,19 @@ export async function runDaemon(argv: string[] = process.argv): Promise<void> {
 
   await ensureDirs();
 
-  const updatedConfig = { ...config, port, host, provider };
+  // The management API accepts NIP-98 signed by this nsec; the CLI reads it
+  // from the same config.json. Create one if `onboard` has not.
+  const nsec = config.nsec || nip19.nsecEncode(generateSecretKey());
+  let managementPubkey: string | undefined;
+  try {
+    managementPubkey = getPublicKey(parseSecretKey(nsec));
+  } catch (error) {
+    logger.error(
+      `Invalid nsec in ${CONFIG_FILE}; the management API will refuse all requests: ${(error as Error).message}`,
+    );
+  }
+
+  const updatedConfig = { ...config, port, host, provider, nsec };
   saveDaemonConfig(updatedConfig);
 
   startupProgress("Opening Routstr databases...");
@@ -229,6 +245,7 @@ export async function runDaemon(argv: string[] = process.argv): Promise<void> {
       providerManager,
       refundClient,
       requestResponseLogSink,
+      authenticateManagement: createNip98ManagementAuth(managementPubkey),
     }),
   );
 

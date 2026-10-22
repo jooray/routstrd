@@ -228,6 +228,7 @@ function makeDeps(overrides: {
   const adapter = makeAdapter(baseUrlsList);
   const modelManager = makeModelManager(adapter, providers, reviews);
   const handler = createDaemonRequestHandler({
+    authenticateManagement: async () => null,
     store,
     discoveryAdapter: adapter,
     modelManager,
@@ -634,6 +635,7 @@ describe("GET /providers/reviews", () => {
 describe("wallet errors", () => {
   it("maps a WalletHttpError onto its HTTP status", async () => {
     const handler = createDaemonRequestHandler({
+      authenticateManagement: async () => null,
       walletClient: { getMintQuote: async () => null },
     } as any);
     const res = await call(handler, "GET", "/wallet/receive/bolt11/missing");

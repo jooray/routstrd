@@ -62,6 +62,7 @@ function makeDeps(entries: Array<Record<string, unknown>> = []) {
     },
   };
   const handler = createDaemonRequestHandler({
+    authenticateManagement: async () => null,
     store,
     providerManager,
   } as any);

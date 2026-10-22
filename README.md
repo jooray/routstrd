@@ -201,6 +201,14 @@ Equivalent daemon endpoints: `GET /wallet/npc/address`,
 
 The daemon exposes an HTTP server (default port 8008) with the following endpoints:
 
+Management endpoints (`/wallet/*`, `/keys/*`, `/clients*`, `/providers*`,
+`/nwc/*`, `/settings/*`, `/cooldowns*`, `/usage*`, `/status`, `/balance`,
+`/refund*`, `/stop`) require a NIP-98 `Authorization: Nostr …` header signed by
+the `nsec` in the daemon's `config.json` (the daemon creates one on start if
+`onboard` has not); the CLI signs every request with it. They refuse
+cross-origin browser requests. `/health`, `/ping`, `/version`, the model
+listings and the proxied inference routes need no management auth.
+
 #### Health Check
 ```
 GET /health

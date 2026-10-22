@@ -26,6 +26,11 @@ import { getUsageSummary, parseTimeWindow } from "./usage-summary";
 import { applyDefaultOutputTokenLimit } from "./request-body";
 import { collapseDuplicatedV1, ensureV1Prefix } from "./request-path";
 import {
+  isCrossOriginRequest,
+  isManagementRoute,
+  type ManagementAuthenticator,
+} from "./management-auth";
+import {
   buildCooldownsOutput,
   type StoredCooldownEntry,
   type StoredFailureStreak,
@@ -123,15 +128,28 @@ function generateApiKey(): string {
   return `sk-${bytes.toString("hex")}`;
 }
 
-async function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", (chunk) => {
-      data += chunk.toString();
+// A management request's body is read once to check its NIP-98 payload hash;
+// the route handler then reads the same bytes from here.
+const bufferedBodies = new WeakMap<IncomingMessage, Promise<Buffer>>();
+
+function readRawBody(req: IncomingMessage): Promise<Buffer> {
+  let body = bufferedBodies.get(req);
+  if (!body) {
+    body = new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk) => {
+        chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+      });
+      req.on("end", () => resolve(Buffer.concat(chunks)));
+      req.on("error", reject);
     });
-    req.on("end", () => resolve(data));
-    req.on("error", reject);
-  });
+    bufferedBodies.set(req, body);
+  }
+  return body;
+}
+
+async function readBody(req: IncomingMessage): Promise<string> {
+  return (await readRawBody(req)).toString("utf8");
 }
 
 async function readJsonBody(
@@ -457,10 +475,39 @@ export function createDaemonRequestHandler(deps: {
   /** Reads the cached update state for GET /version; defaults to the on-disk cache. */
   loadUpdateState?: () => UpdateState | null;
   updateChecksEnabled?: () => boolean;
+  /**
+   * Authorizes management routes (see isManagementRoute); returns null or the
+   * reason for refusing. Without one, every management request is refused.
+   */
+  authenticateManagement?: ManagementAuthenticator;
 }) {
   return async function handler(req: IncomingMessage, res: ServerResponse) {
     const host = req.headers.host || "localhost";
-    const url = new URL(req.url || "/", `http://${host}`);
+    let url: URL;
+    try {
+      url = new URL(req.url || "/", `http://${host}`);
+    } catch {
+      sendJson(res, 400, { error: "Invalid Host header or request URL." });
+      return;
+    }
+
+    if (isManagementRoute(url.pathname)) {
+      if (isCrossOriginRequest(req, host)) {
+        sendJson(res, 403, { error: "Cross-origin requests are not allowed." });
+        return;
+      }
+      const refusal = deps.authenticateManagement
+        ? await deps.authenticateManagement(
+            req,
+            `${url.pathname}${url.search}`,
+            () => readRawBody(req),
+          )
+        : "Management API authentication is not configured.";
+      if (refusal) {
+        sendJson(res, 401, { error: refusal });
+        return;
+      }
+    }
 
     // The node canonicalizes exactly ONE optional "v1/" segment (routstr-core
     // `_canonical_api_path`). A client whose base URL already ends in /v1 while

@@ -70,6 +70,7 @@ function makeRes() {
 
 async function callHistory(path: string, entries?: HistoryEntry[]) {
   const handler = createDaemonRequestHandler({
+    authenticateManagement: async () => null,
     walletClient: makeWalletClient(entries),
   } as any);
   const res = makeRes();

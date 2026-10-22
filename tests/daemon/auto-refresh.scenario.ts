@@ -20,6 +20,7 @@ function assert(cond: unknown, msg: string): void {
  */
 const stubDeps = {
   provider: null,
+  authenticateManagement: async () => null,
   server: { close() {} },
   store: {},
   walletClient: {},

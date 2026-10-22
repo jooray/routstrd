@@ -7,6 +7,7 @@ import { __resetUsageSummaryCacheForTest } from "./usage-summary";
 async function callSummary(query: string, endpoint = "/usage/summary") {
   __resetUsageSummaryCacheForTest();
   const handler = createDaemonRequestHandler({
+    authenticateManagement: async () => null,
     store: { getState: () => ({ clientIds: [] }) },
     usageTrackingDriver: createMemoryUsageTrackingDriver([{
       id: "entry", timestamp: Date.now(), baseUrl: "https://provider.example/",

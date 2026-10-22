@@ -659,7 +659,7 @@ Config file: `~/.routstrd/config.json`
 | `maxTokens` | number | 64000 | Completion budget applied when a client sets no output-token limit |
 | `daemonUrl` | string | — | Remote daemon URL (set by `routstrd remote`) |
 | `authUrl` | string | — | Auth proxy URL for management commands |
-| `nsec` | string | — | Nostr secret key for NIP-98 auth |
+| `nsec` | string | — | Nostr secret key for NIP-98 auth; the local daemon accepts management requests signed by it (created on daemon start if missing) |
 | `relays` | string[] | — | Nostr relays to use for discovery |
 | `routstrPubkey` | string | — | Override the Routstr announcement pubkey |
 | `routstrModelsPubkey` | string | — | Override the routstr21 models pubkey |
